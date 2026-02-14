@@ -1,162 +1,226 @@
+"""
+awnn_cifar100.py - Main training script
+
+Two-phase DeiT training with dynamic neuron pruning:
+  Phase 1: Full training (20 epochs, cross-entropy, 100% params)
+  Phase 2: Pruning (10 epochs, KL+CE loss, max 20% compression)
+"""
+
+import os
+import copy
+import json
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import timm
+import argparse
 from data import get_dataloaders
-from utils import (
-    AWNNTransformerMLP,
-    AWNNDeiTTiny,
-    compute_awnn_elbo_loss,
-    train_one_epoch_awnn,
-    validate_awnn,
-    train_one_epoch_standard,
-    validate_standard
-)
+from utils import PrunableDeiT, train_phase1, train_phase2, validate
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='DeiT CIFAR-100 with Pruning')
+    parser.add_argument('--pretrained', type=str, default='no', choices=['yes', 'no'])
+    return parser.parse_args()
+
 
 def main():
-    """
-    CIFAR-100 training with optional AWNN:
-    - use_awnn=True: AWNN MLPs with Algorithm 1, ELBO optimization
-    - use_awnn=False: Standard DeiT tiny training
-    - No LoRA (full training)
-    - pretrained=False
-    """
+    args = parse_args()
+    use_pretrained = args.pretrained == 'yes'
 
-    # ============ CONFIGURATION ============
-    use_awnn = True  # Set to False for standard training
-    # =======================================
-
-    if use_awnn:
-        print("🚀 AWNN CIFAR-100 Training - Complete Paper Implementation")
-    else:
-        print("🚀 Standard DeiT CIFAR-100 Training")
+    print("=" * 70)
+    print("   DeiT CIFAR-100 Training with Dynamic Neuron Pruning")
     print("=" * 70)
 
-    # Configuration
+    # Config
     DATA_DIR = "/media/jag/volD2/cifer100/cifer"
-    EPOCHS = 20
+    PHASE1_EPOCHS = 20
+    PHASE2_EPOCHS = 10
     BATCH_SIZE = 64
-    LR = 1e-4 if use_awnn else 3e-4  # Lower LR for AWNN stability
+    LR_PHASE1 = 3e-4
+    LR_PHASE2 = 1e-4
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print("Configuration:")
-    print(f"- AWNN Mode: {use_awnn}")
-    print(f"- No LoRA (full training): ✓")
-    print(f"- Pretrained: False ✓")
-    if use_awnn:
-        print(f"- AWNN MLPs in transformer: ✓")
-        print(f"- Algorithm 1 width updates: ✓")
-        print(f"- ELBO optimization: ✓")
-    else:
-        print(f"- Standard transformer MLPs: ✓")
-        print(f"- Standard cross-entropy loss: ✓")
-    print(f"- Device: {DEVICE}")
+    print(f"\nConfiguration:")
+    print(f"  Pretrained:       {'YES' if use_pretrained else 'NO'}")
+    print(f"  Phase 1 (Train):  {PHASE1_EPOCHS} epochs, LR={LR_PHASE1}")
+    print(f"  Phase 2 (Prune):  {PHASE2_EPOCHS} epochs, LR={LR_PHASE2}")
+    print(f"  Max Pruning:      Unlimited (floor: 64 neurons)")
+    print(f"  Prune Step:       5% at a time")
+    print(f"  Cooling Period:   20 batches")
+    print(f"  Phase 2 Loss:     0.5×CE + 0.5×KL (self-distillation)")
+    print(f"  Device:           {DEVICE}")
 
-    # Data loaders using existing data.py
+    # Data
     train_loader, val_loader, num_classes = get_dataloaders(
         DATA_DIR, BATCH_SIZE, class_range=(0, 9), data_ratio=1.0
     )
+    print(f"  Training samples: {len(train_loader.dataset)}")
+    print(f"  Classes:          {num_classes}")
 
-    N = len(train_loader.dataset)  # Total training samples
-    M = BATCH_SIZE                  # Mini-batch size
-
-    print(f"- Training samples: {N}")
-    print(f"- Batch size: {M}")
-    print(f"- Classes: {num_classes}")
-
-    # Create model based on use_awnn flag
-    if use_awnn:
-        model = AWNNDeiTTiny(num_classes=num_classes, pretrained=False).to(DEVICE)
-    else:
-        model = timm.create_model(
-            "deit_tiny_patch16_224",
-            pretrained=False,
-            num_classes=num_classes
-        ).to(DEVICE)
-
-    # Count parameters
+    # Model
+    model = PrunableDeiT(num_classes=num_classes, pretrained=use_pretrained).to(DEVICE)
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"- Total parameters: {total_params:,}")
-    print(f"- Trainable parameters: {trainable_params:,} (100% - no LoRA)")
+    print(f"  Parameters:       {total_params:,}")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.05)
+    os.makedirs('logs', exist_ok=True)
+    tag = 'pretrained' if use_pretrained else 'no_pretrained'
+    phase1_path = f'logs/phase1_{tag}.pth'
 
-    if use_awnn:
-        print("\nTraining with AWNN...")
+    # =========================================================================
+    # PHASE 1
+    # =========================================================================
+    if os.path.exists(phase1_path):
+        print(f"\n{'='*70}")
+        print(f"  PHASE 1: Loading from checkpoint ({phase1_path})")
+        print(f"{'='*70}")
+
+        checkpoint = torch.load(phase1_path, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        phase1_train_acc = checkpoint['train_acc']
+        phase1_val_acc = checkpoint['val_acc']
+        phase1_train_loss = checkpoint['train_loss']
+        phase1_val_loss = checkpoint['val_loss']
+        phase1_val_final = phase1_val_acc[-1]
+
+        print(f"  ✅ Loaded! Phase 1 Val Accuracy: {phase1_val_final:.2f}%")
     else:
-        print("\nTraining with Standard DeiT...")
-    print("=" * 70)
+        print(f"\n{'='*70}")
+        print(f"  PHASE 1: Full Training ({PHASE1_EPOCHS} epochs)")
+        print(f"{'='*70}")
 
-    for epoch in range(1, EPOCHS + 1):
-        if use_awnn:
-            # Algorithm 1: update_width every few epochs
-            if epoch > 1 and epoch % 3 == 0:
-                print(f"Updating widths at epoch {epoch}...")
-                model.update_all_widths()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LR_PHASE1, weight_decay=0.05)
+        phase1_train_acc, phase1_val_acc = [], []
+        phase1_train_loss, phase1_val_loss = [], []
 
-            # AWNN Training
-            elbo, pred_loss, kl_l, kl_t, train_acc = train_one_epoch_awnn(
-                model, train_loader, optimizer, compute_awnn_elbo_loss, N, M, DEVICE
-            )
+        for epoch in range(1, PHASE1_EPOCHS + 1):
+            train_loss, train_acc = train_phase1(model, train_loader, optimizer, DEVICE)
+            val_loss, val_acc = validate(model, val_loader, DEVICE)
 
-            # AWNN Validation
-            val_loss, val_acc = validate_awnn(model, val_loader, DEVICE)
+            phase1_train_acc.append(train_acc * 100)
+            phase1_val_acc.append(val_acc * 100)
+            phase1_train_loss.append(train_loss)
+            phase1_val_loss.append(val_loss)
 
-            # Get current widths
-            all_widths = model.get_current_widths()
-            total_neurons = sum(sum(widths) for widths in all_widths)
-            max_possible = len(all_widths) * len(all_widths[0]) * model.awnn_mlps[0].max_neurons
-            compression = 100 * (1 - total_neurons / max_possible)
+            print(f"  Epoch {epoch:2d}/{PHASE1_EPOCHS} | "
+                  f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:6.2%} | "
+                  f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:6.2%}")
 
-            print(f"\nEpoch {epoch:2d}/{EPOCHS}")
-            print(f"  ELBO Loss: {elbo:8.4f} (pred: {pred_loss:.4f}, KL_λ: {kl_l:.4f}, KL_θ: {kl_t:.4f})")
-            print(f"  Train Acc: {train_acc:6.2%}")
-            print(f"  Val Acc:   {val_acc:6.2%}")
-            print(f"  Total AWNN neurons: {total_neurons} (compression: {compression:.1f}%)")
+        phase1_val_final = phase1_val_acc[-1]
+        print(f"\n  ✅ Phase 1 Complete! Val Accuracy: {phase1_val_final:.2f}%")
 
-            # Show some layer widths
-            if len(all_widths) > 0:
-                print(f"  Example widths: Block 0: {all_widths[0]}, Block {len(all_widths)//2}: {all_widths[len(all_widths)//2]}")
-
-        else:
-            # Standard Training
-            train_loss, train_acc = train_one_epoch_standard(
-                model, train_loader, optimizer, DEVICE
-            )
-
-            # Standard Validation
-            val_loss, val_acc = validate_standard(model, val_loader, DEVICE)
-
-            print(f"\nEpoch {epoch:2d}/{EPOCHS}")
-            print(f"  Train Loss: {train_loss:.4f}")
-            print(f"  Train Acc:  {train_acc:6.2%}")
-            print(f"  Val Loss:   {val_loss:.4f}")
-            print(f"  Val Acc:    {val_acc:6.2%}")
-
-        # Save checkpoint
-        checkpoint_data = {
-            'epoch': epoch,
+        torch.save({
             'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_acc': val_acc,
-            'use_awnn': use_awnn
+            'train_acc': phase1_train_acc,
+            'val_acc': phase1_val_acc,
+            'train_loss': phase1_train_loss,
+            'val_loss': phase1_val_loss,
+        }, phase1_path)
+        print(f"  💾 Phase 1 saved to {phase1_path}")
+
+    # =========================================================================
+    # Reference model for KL distillation (frozen copy, no hooks)
+    # =========================================================================
+    reference_model = copy.deepcopy(model.base_model)
+    for module in reference_model.modules():
+        module._forward_hooks.clear()
+        module._forward_pre_hooks.clear()
+        module._backward_hooks.clear()
+    reference_model.eval()
+    for p in reference_model.parameters():
+        p.requires_grad = False
+
+    print(f"\n  📋 Reference model ready for KL distillation")
+
+    # =========================================================================
+    # PHASE 2
+    # =========================================================================
+    print(f"\n{'='*70}")
+    print(f"  PHASE 2: Pruning ({PHASE2_EPOCHS} epochs, Unlimited Pruning)")
+    print(f"{'='*70}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR_PHASE2, weight_decay=0.05)
+    phase2_train_acc, phase2_val_acc = [], []
+    phase2_train_loss, phase2_val_loss = [], []
+    phase2_compression, phase2_pruned = [], []
+
+    for epoch in range(1, PHASE2_EPOCHS + 1):
+        train_loss, ce_loss, kl_loss, train_acc, neurons_pruned = train_phase2(
+            model, train_loader, optimizer, DEVICE, reference_model
+        )
+        val_loss, val_acc = validate(model, val_loader, DEVICE)
+
+        total_neurons = model.get_total_neurons()
+        initial_neurons = model.get_initial_total()
+        compression = (1 - total_neurons / initial_neurons) * 100
+
+        phase2_train_acc.append(train_acc * 100)
+        phase2_val_acc.append(val_acc * 100)
+        phase2_train_loss.append(train_loss)
+        phase2_val_loss.append(val_loss)
+        phase2_compression.append(compression)
+        phase2_pruned.append(neurons_pruned)
+
+        print(f"  Epoch {epoch:2d}/{PHASE2_EPOCHS} | "
+              f"Loss: {train_loss:.4f} (CE: {ce_loss:.4f} + KL: {kl_loss:.4f}) | "
+              f"Train Acc: {train_acc:6.2%} | Val Acc: {val_acc:6.2%} | "
+              f"Pruned: {neurons_pruned} | Compression: {compression:.1f}%")
+
+        if neurons_pruned > 0 or epoch == PHASE2_EPOCHS:
+            stats = model.get_width_stats()
+            print(f"    Block widths: ", end="")
+            for i, init, curr in stats:
+                if curr < init:
+                    print(f"B{i}:{init}→{curr}", end=" ")
+            print()
+
+    # =========================================================================
+    # Final Summary
+    # =========================================================================
+    total_neurons = model.get_total_neurons()
+    initial_neurons = model.get_initial_total()
+    compression = (1 - total_neurons / initial_neurons) * 100
+
+    print(f"\n{'='*70}")
+    print(f"  FINAL RESULTS")
+    print(f"{'='*70}")
+    print(f"  Phase 1 Val Accuracy:  {phase1_val_final:.2f}%")
+    print(f"  Phase 2 Val Accuracy:  {phase2_val_acc[-1]:.2f}%")
+    print(f"  Accuracy Drop:         {phase1_val_final - phase2_val_acc[-1]:.2f}%")
+    print(f"  Neurons:               {total_neurons}/{initial_neurons}")
+    print(f"  Compression:           {compression:.1f}%")
+    print(f"  Total Pruned:          {sum(phase2_pruned)}")
+    print(f"{'='*70}")
+
+    # Save results for plotting
+    results = {
+        'pretrained': 'yes' if use_pretrained else 'no',
+        'phase1': {
+            'epochs': list(range(1, PHASE1_EPOCHS + 1)),
+            'train_acc': phase1_train_acc,
+            'val_acc': phase1_val_acc,
+            'train_loss': phase1_train_loss,
+            'val_loss': phase1_val_loss
+        },
+        'phase2': {
+            'epochs': list(range(PHASE1_EPOCHS + 1, PHASE1_EPOCHS + PHASE2_EPOCHS + 1)),
+            'train_acc': phase2_train_acc,
+            'val_acc': phase2_val_acc,
+            'train_loss': phase2_train_loss,
+            'val_loss': phase2_val_loss,
+            'compression': phase2_compression,
+            'neurons_pruned': phase2_pruned
+        },
+        'final': {
+            'phase1_val_acc': phase1_val_final,
+            'phase2_val_acc': phase2_val_acc[-1],
+            'accuracy_drop': phase1_val_final - phase2_val_acc[-1],
+            'compression': compression,
+            'total_pruned': sum(phase2_pruned)
         }
+    }
 
-        if use_awnn:
-            checkpoint_data['awnn_widths'] = all_widths
+    with open(f'logs/results_{tag}.json', 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Results saved to logs/results_{tag}.json")
 
-        filename = f"{'awnn' if use_awnn else 'standard'}_cifar100_epoch_{epoch}.pth"
-        torch.save(checkpoint_data, filename)
-
-    if use_awnn:
-        print(f"\n🎉 AWNN CIFAR-100 training completed!")
-        print(f"Final validation accuracy: {val_acc:.2%}")
-        print(f"Final compression: {compression:.1f}%")
-    else:
-        print(f"\n🎉 Standard DeiT CIFAR-100 training completed!")
-        print(f"Final validation accuracy: {val_acc:.2%}")
 
 if __name__ == "__main__":
     main()
