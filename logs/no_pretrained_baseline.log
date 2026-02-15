@@ -1,0 +1,41 @@
+======================================================================
+   DeiT CIFAR-100 Training with Dynamic Neuron Pruning
+======================================================================
+
+Configuration:
+  Pretrained:       NO
+  Phase 1 (Train):  20 epochs, LR=0.0003
+  Phase 2 (Prune):  10 epochs, LR=0.0001
+  Max Pruning:      Unlimited (floor: 64 neurons)
+  Prune Step:       5% at a time
+  Cooling Period:   20 batches
+  Phase 2 Loss:     0.5×CE + 0.5×KL (self-distillation)
+  Device:           cuda
+  Training samples: 4250
+  Classes:          10
+  Parameters:       5,526,346
+
+======================================================================
+  PHASE 1: Loading from checkpoint (logs/phase1_no_pretrained.pth)
+======================================================================
+  ✅ Loaded! Phase 1 Val Accuracy: 53.60%
+
+  📋 Reference model ready for KL distillation
+
+======================================================================
+  PHASE 2: Pruning (10 epochs, Unlimited Pruning)
+======================================================================
+  ⏩ Skipping Phase 2 (Compression Disabled)
+
+======================================================================
+  FINAL RESULTS
+======================================================================
+  Phase 1 Val Accuracy:  53.60%
+  Final Val Accuracy:    53.60%
+  Accuracy Change:       0.00%
+  Neurons:               9216/9216
+  Compression:           0.0%
+  Total Pruned:          0
+======================================================================
+
+  Results saved to logs/results_no_pretrained_baseline.json

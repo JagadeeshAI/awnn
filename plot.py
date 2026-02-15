@@ -42,8 +42,9 @@ def create_plots(results_list):
         ax = axes[0, 0]
         ax.plot(p1['epochs'], p1['val_acc'], '-o', color=c1, linewidth=2, markersize=4,
                 label=f'{label} Phase1')
-        ax.plot(p2['epochs'], p2['val_acc'], '-s', color=c2, linewidth=2, markersize=4,
-                label=f'{label} Phase2')
+        if p2['epochs']:
+            ax.plot(p2['epochs'], p2['val_acc'], '-s', color=c2, linewidth=2, markersize=4,
+                    label=f'{label} Phase2')
 
         # Plot 2: Training Accuracy
         ax = axes[0, 1]

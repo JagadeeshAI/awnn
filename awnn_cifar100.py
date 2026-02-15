@@ -18,12 +18,14 @@ from utils import PrunableDeiT, train_phase1, train_phase2, validate
 def parse_args():
     parser = argparse.ArgumentParser(description='DeiT CIFAR-100 with Pruning')
     parser.add_argument('--pretrained', type=str, default='no', choices=['yes', 'no'])
+    parser.add_argument('--compress', type=str, default='yes', choices=['yes', 'no'])
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     use_pretrained = args.pretrained == 'yes'
+    enable_compression = args.compress == 'yes'
 
     print("=" * 70)
     print("   DeiT CIFAR-100 Training with Dynamic Neuron Pruning")
@@ -141,35 +143,49 @@ def main():
     phase2_train_loss, phase2_val_loss = [], []
     phase2_compression, phase2_pruned = [], []
 
-    for epoch in range(1, PHASE2_EPOCHS + 1):
-        train_loss, ce_loss, kl_loss, train_acc, neurons_pruned = train_phase2(
-            model, train_loader, optimizer, DEVICE, reference_model
-        )
-        val_loss, val_acc = validate(model, val_loader, DEVICE)
+    initial_params = sum(p.numel() for p in model.parameters())
+    if enable_compression:
+        initial_mb = initial_params * 4 / (1024 * 1024)
+        print(f"  Initial Params:   {initial_params:,} ({initial_mb:.2f} MB)")
+        for epoch in range(1, PHASE2_EPOCHS + 1):
+            train_loss, ce_loss, kl_loss, train_acc, neurons_pruned = train_phase2(
+                model, train_loader, optimizer, DEVICE, reference_model
+            )
+            val_loss, val_acc = validate(model, val_loader, DEVICE)
 
-        total_neurons = model.get_total_neurons()
-        initial_neurons = model.get_initial_total()
-        compression = (1 - total_neurons / initial_neurons) * 100
+            total_neurons = model.get_total_neurons()
+            initial_neurons = model.get_initial_total()
+            compression = (1 - total_neurons / initial_neurons) * 100
 
-        phase2_train_acc.append(train_acc * 100)
-        phase2_val_acc.append(val_acc * 100)
-        phase2_train_loss.append(train_loss)
-        phase2_val_loss.append(val_loss)
-        phase2_compression.append(compression)
-        phase2_pruned.append(neurons_pruned)
+            current_params = sum(p.numel() for p in model.parameters())
+            param_reduction = (1 - current_params / initial_params) * 100
 
-        print(f"  Epoch {epoch:2d}/{PHASE2_EPOCHS} | "
-              f"Loss: {train_loss:.4f} (CE: {ce_loss:.4f} + KL: {kl_loss:.4f}) | "
-              f"Train Acc: {train_acc:6.2%} | Val Acc: {val_acc:6.2%} | "
-              f"Pruned: {neurons_pruned} | Compression: {compression:.1f}%")
+            # Size in MB (assuming float32 = 4 bytes)
+            size_mb = current_params * 4 / (1024 * 1024)
+            initial_mb = initial_params * 4 / (1024 * 1024)
 
-        if neurons_pruned > 0 or epoch == PHASE2_EPOCHS:
-            stats = model.get_width_stats()
-            print(f"    Block widths: ", end="")
-            for i, init, curr in stats:
-                if curr < init:
-                    print(f"B{i}:{init}→{curr}", end=" ")
-            print()
+            phase2_train_acc.append(train_acc * 100)
+            phase2_val_acc.append(val_acc * 100)
+            phase2_train_loss.append(train_loss)
+            phase2_val_loss.append(val_loss)
+            phase2_compression.append(compression)
+            phase2_pruned.append(neurons_pruned)
+
+            print(f"  Epoch {epoch:2d}/{PHASE2_EPOCHS} | "
+                  f"Loss: {train_loss:.4f} (CE: {ce_loss:.4f} + KL: {kl_loss:.4f}) | "
+                  f"Train Acc: {train_acc:6.2%} | Val Acc: {val_acc:6.2%} | "
+                  f"Pruned: {neurons_pruned} | Compression: {compression:.1f}% | "
+                  f"Params: {current_params:,} (-{param_reduction:.1f}%) | Size: {size_mb:.2f} MB")
+
+            if neurons_pruned > 0 or epoch == PHASE2_EPOCHS:
+                stats = model.get_width_stats()
+                print(f"    Block widths: ", end="")
+                for i, init, curr in stats:
+                    if curr < init:
+                        print(f"B{i}:{init}→{curr}", end=" ")
+                print()
+    else:
+        print("  ⏩ Skipping Phase 2 (Compression Disabled)")
 
     # =========================================================================
     # Final Summary
@@ -178,20 +194,29 @@ def main():
     initial_neurons = model.get_initial_total()
     compression = (1 - total_neurons / initial_neurons) * 100
 
+    if enable_compression and phase2_val_acc:
+        final_acc = phase2_val_acc[-1]
+    else:
+        final_acc = phase1_val_final
+
     print(f"\n{'='*70}")
     print(f"  FINAL RESULTS")
     print(f"{'='*70}")
     print(f"  Phase 1 Val Accuracy:  {phase1_val_final:.2f}%")
-    print(f"  Phase 2 Val Accuracy:  {phase2_val_acc[-1]:.2f}%")
-    print(f"  Accuracy Drop:         {phase1_val_final - phase2_val_acc[-1]:.2f}%")
+    print(f"  Final Val Accuracy:    {final_acc:.2f}%")
+    print(f"  Accuracy Change:       {final_acc - phase1_val_final:.2f}%")
     print(f"  Neurons:               {total_neurons}/{initial_neurons}")
     print(f"  Compression:           {compression:.1f}%")
     print(f"  Total Pruned:          {sum(phase2_pruned)}")
     print(f"{'='*70}")
 
     # Save results for plotting
+    tag = 'pretrained' if use_pretrained else 'no_pretrained'
+    tag += '_pruned' if enable_compression else '_baseline'
+
     results = {
         'pretrained': 'yes' if use_pretrained else 'no',
+        'cumpress': 'yes' if enable_compression else 'no',
         'phase1': {
             'epochs': list(range(1, PHASE1_EPOCHS + 1)),
             'train_acc': phase1_train_acc,
@@ -200,7 +225,7 @@ def main():
             'val_loss': phase1_val_loss
         },
         'phase2': {
-            'epochs': list(range(PHASE1_EPOCHS + 1, PHASE1_EPOCHS + PHASE2_EPOCHS + 1)),
+            'epochs': list(range(PHASE1_EPOCHS + 1, PHASE1_EPOCHS + PHASE2_EPOCHS + 1)) if enable_compression else [],
             'train_acc': phase2_train_acc,
             'val_acc': phase2_val_acc,
             'train_loss': phase2_train_loss,
@@ -210,8 +235,8 @@ def main():
         },
         'final': {
             'phase1_val_acc': phase1_val_final,
-            'phase2_val_acc': phase2_val_acc[-1],
-            'accuracy_drop': phase1_val_final - phase2_val_acc[-1],
+            'phase2_val_acc': final_acc,
+            'accuracy_change': final_acc - phase1_val_final,
             'compression': compression,
             'total_pruned': sum(phase2_pruned)
         }
